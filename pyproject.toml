@@ -4,16 +4,14 @@ build-backend = "maturin"
 
 [project]
 name = "fastwalk"
-version = "1.4.8"
-author = [
-{ name = "isaac", email = "mkalafsaz@gmail.com"}
-]
+version = "1.4.7"
+author = [{ name = "isaac", email = "mkalafsaz@gmail.com" }]
 description = "Fast filesystem traversal using Rust's jwalk"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 classifiers = [
-    "Programming Language :: Rust",
-    "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
 ]
 
 [tool.maturin]

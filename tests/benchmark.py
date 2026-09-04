@@ -1,12 +1,12 @@
 import os
 import time
 import fastwalk
+from pathlib import Path
 
-SAMPLE_DIR = "/data/data/com.termux/files"
+SAMPLE_DIR = Path.home()
 
 
 def benchmark_walk(path: str = SAMPLE_DIR):
-    """Benchmark basic walk function"""
     print(f"Benchmarking walk on: {path}")
 
     start = time.time()
@@ -19,7 +19,6 @@ def benchmark_walk(path: str = SAMPLE_DIR):
 
 
 def benchmark_walk_files(path: str = SAMPLE_DIR):
-    """Benchmark walk_files function"""
     print(f"\nBenchmarking walk_files on: {path}")
 
     start = time.time()
@@ -32,7 +31,6 @@ def benchmark_walk_files(path: str = SAMPLE_DIR):
 
 
 def benchmark_walk_with_metadata(path: str = SAMPLE_DIR):
-    """Benchmark walk_with_metadata function"""
     print(f"\nBenchmarking walk_with_metadata on: {path}")
 
     start = time.time()
@@ -42,7 +40,6 @@ def benchmark_walk_with_metadata(path: str = SAMPLE_DIR):
     print(f"Found {len(results)} entries in {elapsed:.4f} seconds")
     print(f"Speed: {len(results) / elapsed:.2f} entries/second")
 
-    # Show some metadata
     if results:
         entry = results[0]
         print(f"\nExample entry:")
@@ -55,7 +52,6 @@ def benchmark_walk_with_metadata(path: str = SAMPLE_DIR):
 
 
 def benchmark_walk_parallel(path: str = SAMPLE_DIR):
-    """Benchmark parallel walk function"""
     print(f"\nBenchmarking walk_parallel on: {path}")
 
     start = time.time()
@@ -68,15 +64,12 @@ def benchmark_walk_parallel(path: str = SAMPLE_DIR):
 
 
 def compare_with_os_walk(path: str = SAMPLE_DIR):
-    """Compare with Python's os.walk"""
     print(f"\nComparing with os.walk on: {path}")
 
-    # fastwalk
     start = time.time()
     fastwalk_results = fastwalk.walk(path)
     fastwalk_time = time.time() - start
 
-    # os.walk
     start = time.time()
     os_walk_results = []
     for root, dirs, files in os.walk(path):
@@ -93,7 +86,6 @@ def compare_with_os_walk(path: str = SAMPLE_DIR):
 
 
 if __name__ == "__main__":
-    # Use current directory or specify a path
     test_path = SAMPLE_DIR
 
     print("=" * 60)
@@ -110,7 +102,6 @@ if __name__ == "__main__":
     print("Benchmark complete!")
     print("=" * 60)
 
-### exampke output
 """
 ============================================================
 FastWalk Benchmark Suite

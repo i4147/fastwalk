@@ -1,50 +1,75 @@
 use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyString};
-use std::path::PathBuf;
+use pyo3::types::PyAny;
+use std::path::{Path, PathBuf};
 
-// Helper function to convert PathBuf to Python Path object
+// Directories to skip during traversal
+const SKIP_DIRS: &[&str] = &[".git", "__pycache__", ".mypy_cache", "lazy"];
+
 fn to_py_path<'py>(py: Python<'py>, path: PathBuf) -> PyResult<&'py PyAny> {
     let pathlib = py.import("pathlib")?;
     pathlib.call_method1("Path", (path,))
 }
 
-// Custom type that accepts both Path and str
 #[derive(Clone)]
 struct PathInput(PathBuf);
 
 impl<'py> FromPyObject<'py> for PathInput {
     fn extract(obj: &'py PyAny) -> PyResult<Self> {
-        // If it's a string, convert to PathBuf
         if let Ok(s) = obj.extract::<String>() {
             return Ok(PathInput(PathBuf::from(s)));
         }
-        
-        // If it's a Path object, extract the string representation
+
         if let Ok(path_str) = obj.call_method0("__str__") {
             if let Ok(s) = path_str.extract::<String>() {
                 return Ok(PathInput(PathBuf::from(s)));
             }
         }
-        
+
         Err(pyo3::exceptions::PyTypeError::new_err(
             "Expected a string or pathlib.Path object",
         ))
     }
 }
 
-// Helper function to convert PathInput to PathBuf
 impl From<PathInput> for PathBuf {
     fn from(input: PathInput) -> Self {
         input.0
     }
 }
 
+/// Helper function to filter entries based on skip list and symlink preference
+fn should_skip_entry(entry: &jwalk::DirEntry<((), ())>, skip_symlinks: bool) -> bool {
+    let name = entry.file_name();
+    // Skip directories in the skip list
+    if let Some(name_str) = name.to_str() {
+        if SKIP_DIRS.contains(&name_str) {
+            return true;
+        }
+    }
+    // Skip symlinks if requested
+    if skip_symlinks && entry.file_type().is_symlink() {
+        return true;
+    }
+    false
+}
+
 #[pyfunction]
 fn walk(py: Python<'_>, path: PathInput, follow_links: Option<bool>) -> PyResult<Vec<&PyAny>> {
     let follow = follow_links.unwrap_or(false);
     let path_buf: PathBuf = path.into();
-    let walker = jwalk::WalkDir::new(&path_buf).follow_links(follow);
+    
+    let walker = jwalk::WalkDir::new(&path_buf)
+        .follow_links(follow)
+        .process_read_dir(move |_depth: Option<usize>, _path: &Path, _state: &mut (), entries: &mut Vec<Result<jwalk::DirEntry<((), ())>, jwalk::Error>>| {
+            entries.retain(|entry| {
+                match entry {
+                    Ok(e) => !should_skip_entry(e, !follow),
+                    Err(_) => false, // Keep errors by not filtering them out
+                }
+            });
+        });
+    
     let mut results = Vec::new();
 
     for entry in walker {
@@ -64,10 +89,25 @@ fn walk(py: Python<'_>, path: PathInput, follow_links: Option<bool>) -> PyResult
 }
 
 #[pyfunction]
-fn walk_files(py: Python<'_>, path: PathInput, follow_links: Option<bool>) -> PyResult<Vec<&PyAny>> {
+fn walk_files(
+    py: Python<'_>,
+    path: PathInput,
+    follow_links: Option<bool>,
+) -> PyResult<Vec<&PyAny>> {
     let follow = follow_links.unwrap_or(false);
     let path_buf: PathBuf = path.into();
-    let walker = jwalk::WalkDir::new(&path_buf).follow_links(follow);
+    
+    let walker = jwalk::WalkDir::new(&path_buf)
+        .follow_links(follow)
+        .process_read_dir(move |_depth: Option<usize>, _path: &Path, _state: &mut (), entries: &mut Vec<Result<jwalk::DirEntry<((), ())>, jwalk::Error>>| {
+            entries.retain(|entry| {
+                match entry {
+                    Ok(e) => !should_skip_entry(e, !follow),
+                    Err(_) => false,
+                }
+            });
+        });
+    
     let mut results = Vec::new();
 
     for entry in walker {
@@ -92,7 +132,18 @@ fn walk_files(py: Python<'_>, path: PathInput, follow_links: Option<bool>) -> Py
 fn walk_dirs(py: Python<'_>, path: PathInput, follow_links: Option<bool>) -> PyResult<Vec<&PyAny>> {
     let follow = follow_links.unwrap_or(false);
     let path_buf: PathBuf = path.into();
-    let walker = jwalk::WalkDir::new(&path_buf).follow_links(follow);
+    
+    let walker = jwalk::WalkDir::new(&path_buf)
+        .follow_links(follow)
+        .process_read_dir(move |_depth: Option<usize>, _path: &Path, _state: &mut (), entries: &mut Vec<Result<jwalk::DirEntry<((), ())>, jwalk::Error>>| {
+            entries.retain(|entry| {
+                match entry {
+                    Ok(e) => !should_skip_entry(e, !follow),
+                    Err(_) => false,
+                }
+            });
+        });
+    
     let mut results = Vec::new();
 
     for entry in walker {
@@ -138,7 +189,16 @@ fn walk_with_metadata(
 ) -> PyResult<Vec<Entry>> {
     let follow = follow_links.unwrap_or(false);
     let path_buf: PathBuf = path.into();
-    let mut walker = jwalk::WalkDir::new(&path_buf).follow_links(follow);
+    let mut walker = jwalk::WalkDir::new(&path_buf)
+        .follow_links(follow)
+        .process_read_dir(move |_depth: Option<usize>, _path: &Path, _state: &mut (), entries: &mut Vec<Result<jwalk::DirEntry<((), ())>, jwalk::Error>>| {
+            entries.retain(|entry| {
+                match entry {
+                    Ok(e) => !should_skip_entry(e, !follow),
+                    Err(_) => false,
+                }
+            });
+        });
 
     if let Some(max) = max_depth {
         walker = walker.max_depth(max);
@@ -153,7 +213,7 @@ fn walk_with_metadata(
         match entry {
             Ok(e) => {
                 let file_type = e.file_type();
-                let py_path = to_py_path(py, e.path())?.into(); // Convert reference to a persistent Py object
+                let py_path = to_py_path(py, e.path())?.into();
                 results.push(Entry {
                     path: py_path,
                     is_file: file_type.is_file(),
@@ -186,6 +246,14 @@ fn walk_parallel(
 
     let walker = jwalk::WalkDir::new(&path_buf)
         .follow_links(follow)
+        .process_read_dir(move |_depth: Option<usize>, _path: &Path, _state: &mut (), entries: &mut Vec<Result<jwalk::DirEntry<((), ())>, jwalk::Error>>| {
+            entries.retain(|entry| {
+                match entry {
+                    Ok(e) => !should_skip_entry(e, !follow),
+                    Err(_) => false,
+                }
+            });
+        })
         .parallelism(jwalk::Parallelism::RayonNewPool(threads));
 
     let mut results = Vec::new();

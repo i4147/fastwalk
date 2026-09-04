@@ -16,4 +16,4 @@ __all__ = [
     "Entry",
 ]
 
-__version__ = "0.3.6"
+__version__ = "1.4.7"
