@@ -1,184 +1,173 @@
-use pyo3::exceptions::{PyOSError, PyTypeError};
+use jwalk::{DirEntry, Parallelism, WalkDir};
+use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyAnyMethods, PyModule, PyString};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-// Directories to skip during traversal
-const SKIP_DIRS: &[&str] = &[".git", "__pycache__", ".mypy_cache", "lazy"];
+type Item = Result<DirEntry<((), ())>, jwalk::Error>;
 
-// Bound API: return a Bound<'py, PyAny> instead of &'py PyAny.
-fn to_py_path<'py>(py: Python<'py>, path: PathBuf) -> PyResult<Bound<'py, PyAny>> {
-    let pathlib = py.import("pathlib")?;
-    // PathBuf implements IntoPyObject, so we can pass it directly.
-    pathlib.call_method1("Path", (path,))
+/// Default directory names to skip. A leading `*` means "ends with"
+/// (so `*.dist-info` skips every `foo-1.0.dist-info` directory).
+const DEFAULT_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "__pycache__",
+    "lazy",
+    ".mypy_cache",
+    ".pytest_cache",
+    "*.dist-info",
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    All,
+    Files,
+    Dirs,
 }
 
-#[derive(Clone)]
-struct PathInput(PathBuf);
-
-impl<'py> FromPyObject<'py> for PathInput {
-    // Bound API: extract takes Bound<'py, PyAny>, not &'py PyAny.
-    fn extract_bound(obj: &Bound<'py, PyAny>) -> PyResult<Self> {
-        // Try plain str first.
-        if let Ok(s) = obj.extract::<String>() {
-            return Ok(PathInput(PathBuf::from(s)));
-        }
-
-        // Try os.PathLike / pathlib.Path via __fspath__, falling back to __str__.
-        if let Ok(path_str) = obj.call_method0("__fspath__") {
-            if let Ok(s) = path_str.extract::<String>() {
-                return Ok(PathInput(PathBuf::from(s)));
-            }
-        }
-
-        if let Ok(path_str) = obj.call_method0("__str__") {
-            if let Ok(s) = path_str.extract::<String>() {
-                return Ok(PathInput(PathBuf::from(s)));
-            }
-        }
-
-        Err(PyTypeError::new_err(
-            "Expected a string or pathlib.Path object",
-        ))
+fn name_matches(name: &str, pattern: &str) -> bool {
+    match pattern.strip_prefix('*') {
+        Some(suffix) => name.ends_with(suffix),
+        None => name == pattern,
     }
 }
 
-impl From<PathInput> for PathBuf {
-    fn from(input: PathInput) -> Self {
-        input.0
-    }
-}
-
-/// Helper function to filter entries based on skip list and symlink preference
-fn should_skip_entry(entry: &jwalk::DirEntry<((), ())>, skip_symlinks: bool) -> bool {
-    let name = entry.file_name();
-    if let Some(name_str) = name.to_str() {
-        if SKIP_DIRS.contains(&name_str) {
-            return true;
-        }
-    }
-    if skip_symlinks && entry.file_type().is_symlink() {
-        return true;
-    }
-    false
-}
-
-#[pyfunction]
-// Bound API: return Vec<Bound<'py, PyAny>>; tie 'py to Python<'py>.
-fn walk<'py>(
-    py: Python<'py>,
-    path: PathInput,
-    follow_links: Option<bool>,
-) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    let follow = follow_links.unwrap_or(false);
-    let path_buf: PathBuf = path.into();
-
-    let walker = jwalk::WalkDir::new(&path_buf)
-        .follow_links(follow)
-        .process_read_dir(move |_depth: Option<usize>, _path: &Path, _state: &mut (), entries: &mut Vec<Result<jwalk::DirEntry<((), ())>, jwalk::Error>>| {
-            entries.retain(|entry| match entry {
-                Ok(e) => !should_skip_entry(e, !follow),
-                Err(_) => false,
-            });
-        });
-
-    let mut results = Vec::new();
-
-    for entry in walker {
-        match entry {
-            Ok(e) => results.push(to_py_path(py, e.path())?),
-            Err(e) => {
-                return Err(PyOSError::new_err(format!(
-                    "Error walking directory: {}",
+fn normalize_exts(exts: Option<Vec<String>>) -> Option<Vec<String>> {
+    exts.map(|v| {
+        v.into_iter()
+            .map(|e| {
+                let e = e.to_lowercase();
+                if e.starts_with('.') {
                     e
-                )));
-            }
-        }
-    }
-    Ok(results)
+                } else {
+                    format!(".{e}")
+                }
+            })
+            .collect()
+    })
 }
 
-#[pyfunction]
-fn walk_files<'py>(
-    py: Python<'py>,
-    path: PathInput,
-    follow_links: Option<bool>,
-) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    let follow = follow_links.unwrap_or(false);
-    let path_buf: PathBuf = path.into();
+/// Shared walking logic used by all iterators.
+struct Core {
+    iter: Box<dyn Iterator<Item = Item>>,
+    kind: Kind,
+    exts: Option<Vec<String>>,
+}
 
-    let walker = jwalk::WalkDir::new(&path_buf)
-        .follow_links(follow)
-        .process_read_dir(move |_depth: Option<usize>, _path: &Path, _state: &mut (), entries: &mut Vec<Result<jwalk::DirEntry<((), ())>, jwalk::Error>>| {
-            entries.retain(|entry| match entry {
-                Ok(e) => !should_skip_entry(e, !follow),
-                Err(_) => false,
+impl Core {
+    fn new(
+        path: PathBuf,
+        kind: Kind,
+        exts: Option<Vec<String>>,
+        skip_dirs: Option<Vec<String>>,
+        follow_links: bool,
+        skip_symlinks: bool,
+        max_depth: Option<usize>,
+        min_depth: Option<usize>,
+        parallelism: Option<Parallelism>,
+    ) -> Self {
+        let skip_dirs: Vec<String> =
+            skip_dirs.unwrap_or_else(|| DEFAULT_SKIP_DIRS.iter().map(|s| s.to_string()).collect());
+
+        let mut walker = WalkDir::new(path).follow_links(follow_links);
+        if let Some(max) = max_depth {
+            walker = walker.max_depth(max);
+        }
+        if let Some(min) = min_depth {
+            walker = walker.min_depth(min);
+        }
+        if let Some(p) = parallelism {
+            walker = walker.parallelism(p);
+        }
+
+        // Prune before descending, so skipped dirs are never read.
+        let walker = walker.process_read_dir(move |_depth, _path, _state, children| {
+            children.retain(|res| match res {
+                Ok(e) => {
+                    if skip_symlinks && e.path_is_symlink() {
+                        return false;
+                    }
+                    if e.file_type().is_dir() {
+                        let name = e.file_name().to_string_lossy();
+                        if skip_dirs.iter().any(|p| name_matches(&name, p)) {
+                            return false;
+                        }
+                    }
+                    true
+                }
+                Err(_) => true, // let errors surface in the iterator
             });
         });
 
-    let mut results = Vec::new();
+        Core {
+            iter: Box::new(walker.into_iter()),
+            kind,
+            exts: normalize_exts(exts),
+        }
+    }
 
-    for entry in walker {
-        match entry {
-            Ok(e) => {
-                if e.file_type().is_file() {
-                    results.push(to_py_path(py, e.path())?);
+    fn accept(&self, e: &DirEntry<((), ())>) -> bool {
+        let ft = e.file_type();
+        match self.kind {
+            Kind::Files if !ft.is_file() => return false,
+            Kind::Dirs if !ft.is_dir() => return false,
+            _ => {}
+        }
+        if let (Some(exts), true) = (&self.exts, self.kind != Kind::Dirs) {
+            if ft.is_dir() {
+                return false;
+            }
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            if !exts.iter().any(|x| name.ends_with(x.as_str())) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn next_entry(&mut self) -> PyResult<Option<DirEntry<((), ())>>> {
+        while let Some(item) = self.iter.next() {
+            match item {
+                Ok(e) => {
+                    if self.accept(&e) {
+                        return Ok(Some(e));
+                    }
+                }
+                Err(err) => {
+                    return Err(PyOSError::new_err(format!(
+                        "Error walking directory: {}",
+                        err
+                    )));
                 }
             }
-            Err(e) => {
-                return Err(PyOSError::new_err(format!(
-                    "Error walking directory: {}",
-                    e
-                )));
-            }
         }
+        Ok(None)
     }
-    Ok(results)
 }
 
-#[pyfunction]
-fn walk_dirs<'py>(
-    py: Python<'py>,
-    path: PathInput,
-    follow_links: Option<bool>,
-) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    let follow = follow_links.unwrap_or(false);
-    let path_buf: PathBuf = path.into();
+/// Lazy iterator yielding path strings.
+#[pyclass(unsendable)]
+struct PathIter {
+    core: Core,
+}
 
-    let walker = jwalk::WalkDir::new(&path_buf)
-        .follow_links(follow)
-        .process_read_dir(move |_depth: Option<usize>, _path: &Path, _state: &mut (), entries: &mut Vec<Result<jwalk::DirEntry<((), ())>, jwalk::Error>>| {
-            entries.retain(|entry| match entry {
-                Ok(e) => !should_skip_entry(e, !follow),
-                Err(_) => false,
-            });
-        });
-
-    let mut results = Vec::new();
-
-    for entry in walker {
-        match entry {
-            Ok(e) => {
-                if e.file_type().is_dir() {
-                    results.push(to_py_path(py, e.path())?);
-                }
-            }
-            Err(e) => {
-                return Err(PyOSError::new_err(format!(
-                    "Error walking directory: {}",
-                    e
-                )));
-            }
-        }
+#[pymethods]
+impl PathIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
     }
-    Ok(results)
+
+    fn __next__(&mut self) -> PyResult<Option<String>> {
+        Ok(self
+            .core
+            .next_entry()?
+            .map(|e| e.path().to_string_lossy().to_string()))
+    }
 }
 
 #[pyclass]
-// Removed #[derive(Clone)] — Py<PyAny> is no longer Clone.
+#[derive(Clone)]
 struct Entry {
     #[pyo3(get)]
-    path: Py<PyAny>,
+    path: String,
     #[pyo3(get)]
     is_file: bool,
     #[pyo3(get)]
@@ -189,104 +178,171 @@ struct Entry {
     depth: usize,
 }
 
+/// Lazy iterator yielding `Entry` objects.
+#[pyclass(unsendable)]
+struct EntryIter {
+    core: Core,
+}
+
+#[pymethods]
+impl EntryIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self) -> PyResult<Option<Entry>> {
+        Ok(self.core.next_entry()?.map(|e| {
+            let ft = e.file_type();
+            Entry {
+                path: e.path().to_string_lossy().to_string(),
+                is_file: ft.is_file(),
+                is_dir: ft.is_dir(),
+                is_symlink: e.path_is_symlink(),
+                depth: e.depth(),
+            }
+        }))
+    }
+}
+
+/// Walk everything (files + dirs). With `exts`, only matching files are yielded.
 #[pyfunction]
-fn walk_with_metadata(
-    py: Python<'_>,
-    path: PathInput,
-    follow_links: Option<bool>,
-    max_depth: Option<usize>,
-    min_depth: Option<usize>,
-) -> PyResult<Vec<Entry>> {
-    let follow = follow_links.unwrap_or(false);
-    let path_buf: PathBuf = path.into();
-    let mut walker = jwalk::WalkDir::new(&path_buf)
-        .follow_links(follow)
-        .process_read_dir(move |_depth: Option<usize>, _path: &Path, _state: &mut (), entries: &mut Vec<Result<jwalk::DirEntry<((), ())>, jwalk::Error>>| {
-            entries.retain(|entry| match entry {
-                Ok(e) => !should_skip_entry(e, !follow),
-                Err(_) => false,
-            });
-        });
-
-    if let Some(max) = max_depth {
-        walker = walker.max_depth(max);
+#[pyo3(signature = (path, exts=None, skip_dirs=None, follow_links=false, skip_symlinks=true))]
+fn walk(
+    path: PathBuf,
+    exts: Option<Vec<String>>,
+    skip_dirs: Option<Vec<String>>,
+    follow_links: bool,
+    skip_symlinks: bool,
+) -> PathIter {
+    PathIter {
+        core: Core::new(
+            path,
+            Kind::All,
+            exts,
+            skip_dirs,
+            follow_links,
+            skip_symlinks,
+            None,
+            None,
+            None,
+        ),
     }
-    if let Some(min) = min_depth {
-        walker = walker.min_depth(min);
-    }
-
-    let mut results = Vec::new();
-
-    for entry in walker {
-        match entry {
-            Ok(e) => {
-                let file_type = e.file_type();
-                // Bound -> Py<PyAny> via .unbind().
-                let py_path: Py<PyAny> = to_py_path(py, e.path())?.unbind();
-                results.push(Entry {
-                    path: py_path,
-                    is_file: file_type.is_file(),
-                    is_dir: file_type.is_dir(),
-                    is_symlink: file_type.is_symlink(),
-                    depth: e.depth(),
-                });
-            }
-            Err(e) => {
-                return Err(PyOSError::new_err(format!(
-                    "Error walking directory: {}",
-                    e
-                )));
-            }
-        }
-    }
-    Ok(results)
 }
 
 #[pyfunction]
-fn walk_parallel<'py>(
-    py: Python<'py>,
-    path: PathInput,
-    follow_links: Option<bool>,
-    num_threads: Option<usize>,
-) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    let follow = follow_links.unwrap_or(false);
-    let path_buf: PathBuf = path.into();
-    let threads = num_threads.unwrap_or(0);
-
-    let walker = jwalk::WalkDir::new(&path_buf)
-        .follow_links(follow)
-        .process_read_dir(move |_depth: Option<usize>, _path: &Path, _state: &mut (), entries: &mut Vec<Result<jwalk::DirEntry<((), ())>, jwalk::Error>>| {
-            entries.retain(|entry| match entry {
-                Ok(e) => !should_skip_entry(e, !follow),
-                Err(_) => false,
-            });
-        })
-        .parallelism(jwalk::Parallelism::RayonNewPool(threads));
-
-    let mut results = Vec::new();
-
-    for entry in walker {
-        match entry {
-            Ok(e) => results.push(to_py_path(py, e.path())?),
-            Err(e) => {
-                return Err(PyOSError::new_err(format!(
-                    "Error walking directory: {}",
-                    e
-                )));
-            }
-        }
+#[pyo3(signature = (path, exts=None, skip_dirs=None, follow_links=false, skip_symlinks=true))]
+fn walk_files(
+    path: PathBuf,
+    exts: Option<Vec<String>>,
+    skip_dirs: Option<Vec<String>>,
+    follow_links: bool,
+    skip_symlinks: bool,
+) -> PathIter {
+    PathIter {
+        core: Core::new(
+            path,
+            Kind::Files,
+            exts,
+            skip_dirs,
+            follow_links,
+            skip_symlinks,
+            None,
+            None,
+            None,
+        ),
     }
-    Ok(results)
+}
+
+/// Directories only (`exts` doesn't apply here).
+#[pyfunction]
+#[pyo3(signature = (path, skip_dirs=None, follow_links=false, skip_symlinks=true))]
+fn walk_dirs(
+    path: PathBuf,
+    skip_dirs: Option<Vec<String>>,
+    follow_links: bool,
+    skip_symlinks: bool,
+) -> PathIter {
+    PathIter {
+        core: Core::new(
+            path,
+            Kind::Dirs,
+            None,
+            skip_dirs,
+            follow_links,
+            skip_symlinks,
+            None,
+            None,
+            None,
+        ),
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    path, exts=None, skip_dirs=None, follow_links=false, skip_symlinks=true,
+    max_depth=None, min_depth=None
+))]
+fn walk_with_metadata(
+    path: PathBuf,
+    exts: Option<Vec<String>>,
+    skip_dirs: Option<Vec<String>>,
+    follow_links: bool,
+    skip_symlinks: bool,
+    max_depth: Option<usize>,
+    min_depth: Option<usize>,
+) -> EntryIter {
+    EntryIter {
+        core: Core::new(
+            path,
+            Kind::All,
+            exts,
+            skip_dirs,
+            follow_links,
+            skip_symlinks,
+            max_depth,
+            min_depth,
+            None,
+        ),
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    path, exts=None, skip_dirs=None, follow_links=false, skip_symlinks=true,
+    num_threads=None
+))]
+fn walk_parallel(
+    path: PathBuf,
+    exts: Option<Vec<String>>,
+    skip_dirs: Option<Vec<String>>,
+    follow_links: bool,
+    skip_symlinks: bool,
+    num_threads: Option<usize>,
+) -> PathIter {
+    PathIter {
+        core: Core::new(
+            path,
+            Kind::All,
+            exts,
+            skip_dirs,
+            follow_links,
+            skip_symlinks,
+            None,
+            None,
+            Some(Parallelism::RayonNewPool(num_threads.unwrap_or(0))),
+        ),
+    }
 }
 
 #[pymodule]
-// Bound API: the module fn takes &Bound<'_, PyModule>, not (py, &PyModule).
-fn fastwalk(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn fastwalk(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(walk, m)?)?;
     m.add_function(wrap_pyfunction!(walk_files, m)?)?;
     m.add_function(wrap_pyfunction!(walk_dirs, m)?)?;
     m.add_function(wrap_pyfunction!(walk_with_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(walk_parallel, m)?)?;
     m.add_class::<Entry>()?;
+    m.add_class::<PathIter>()?;
+    m.add_class::<EntryIter>()?;
     Ok(())
 }
