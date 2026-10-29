@@ -5,9 +5,13 @@
 *.log
 *.py[cod]
 *.pyc
+*.pyd
+*.so
 *.tmp
 .env
 .venv/
+.mypy_cache/
+.pytest_cache/
 __pycache__/
 credential.json
 out/
